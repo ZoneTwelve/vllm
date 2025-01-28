@@ -18,23 +18,63 @@ import json
 import math
 from collections import defaultdict
 from functools import lru_cache
-from typing import Callable, DefaultDict, Dict, List, Union
+from typing import Any, Callable, DefaultDict, Dict, List, Union
 
 import torch
-from lark import Lark
 from outlines import grammars
 from outlines.caching import cache
-from outlines.fsm.guide import CFGGuide, Generate, Guide, RegexGuide, Write
-from outlines.fsm.json_schema import build_regex_from_schema
+from outlines.fsm.guide import (CFGGuide, CFGState, Generate, Guide,
+                                RegexGuide, Write)
+from outlines.fsm.parsing import PartialLark
+from outlines_core.fsm.json_schema import build_regex_from_schema
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizerBase
+
+
+# Unfortunately we cannot use lru_cache as it breaks pickling
+# so we use a simpler implementation
+def _cached(fn):
+    cache: Dict[Any, Any] = {}
+
+    def cached_fn(*args):
+        if args in cache:
+            result = cache[args]
+        else:
+            result = fn(*args)
+            cache[args] = result
+        return result
+
+    return cached_fn
 
 
 class BaseLogitsProcessor:
 
     def __init__(self, guide: Guide):
         self._guide: Guide = guide
-        self._fsm_state: DefaultDict[int, int] = defaultdict(int)
+        # CFGState is used for the FSM state for CFGGuide
+        self._fsm_state: DefaultDict[int, Union[int,
+                                                CFGState]] = defaultdict(int)
+        self._cached_get_mask_tensor = _cached(self._get_mask_tensor)
+
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def _create_mask_tensor(allowed_tokens, vocab_size, device):
+        mask = torch.full((vocab_size, ), -math.inf, device=device)
+        mask[list(allowed_tokens)] = 0
+        return mask
+
+    def _get_mask_tensor(self, state_id, vocab_size, device):
+        instruction = self._guide.get_next_instruction(state=state_id)
+        if type(instruction) == Generate:  # noqa: E721
+            allowed_tokens = instruction.tokens
+        elif type(instruction) == Write:  # noqa: E721
+            # TODO: support fast forward tokens
+            allowed_tokens = [instruction.tokens[0]]
+        else:
+            raise TypeError(
+                f"Unsupported instruction type {type(instruction)}")
+        return BaseLogitsProcessor._create_mask_tensor(tuple(allowed_tokens),
+                                                       vocab_size, device)
 
     def __call__(self, input_ids: List[int],
                  scores: torch.Tensor) -> torch.Tensor:
@@ -54,32 +94,17 @@ class BaseLogitsProcessor:
             # On the first time this is called, we simply re-create
             # the Lark object.
             if isinstance(self._guide, CFGGuide):
-                self._guide.parser = Lark(
+                self._guide.parser = PartialLark(
                     self._guide.cfg_string,
                     parser="lalr",
-                    lexer="contextual",
-                    propagate_positions=False,
-                    maybe_placeholders=False,
-                    regex=True,
                     import_paths=[grammars.GRAMMAR_PATH],
                 )
+                self._fsm_state[seq_id] = CFGState(
+                    parser_state=self._guide.parser.parse(""), prev_token=None)
 
-        instruction = self._guide.get_next_instruction(
-            state=self._fsm_state[seq_id])
-
-        if type(instruction) == Generate:  # noqa: E721
-            allowed_tokens = instruction.tokens
-        elif type(instruction) == Write:  # noqa: E721
-            # TODO: support fast forward tokens
-            allowed_tokens = [instruction.tokens[0]]
-        else:
-            raise TypeError(
-                f"Unsupported instruction type {type(instruction)}")
-
-        mask = torch.full((scores.shape[-1], ),
-                          -math.inf,
-                          device=scores.device)
-        mask[allowed_tokens] = 0
+        state_id = self._fsm_state[seq_id]
+        mask = self._cached_get_mask_tensor(state_id, scores.size(-1),
+                                            scores.device)
         scores.add_(mask)
         return scores
 
@@ -91,7 +116,7 @@ class RegexLogitsProcessor(BaseLogitsProcessor):
     def _get_guide(cls, regex_string: str,
                    tokenizer: PreTrainedTokenizerBase) -> Guide:
         tokenizer = _adapt_tokenizer(tokenizer)
-        return RegexGuide(regex_string, tokenizer)
+        return RegexGuide.from_regex(regex_string, tokenizer)
 
     def __init__(self, regex_string: str, tokenizer: PreTrainedTokenizerBase):
         """Compile the FSM that drives the regex-structured generation.
@@ -192,7 +217,8 @@ def _adapt_tokenizer(tokenizer: PreTrainedTokenizerBase):
         string = tokenizer.convert_tokens_to_string([token])
 
         # A hack to handle missing spaces to HF's Llama tokenizers
-        if token.startswith(SPIECE_UNDERLINE) or token == "<0x20>":
+        if (type(token) is str and token.startswith(SPIECE_UNDERLINE)
+                or token == "<0x20>"):
             return " " + string
 
         return string
@@ -203,6 +229,9 @@ def _adapt_tokenizer(tokenizer: PreTrainedTokenizerBase):
         """Sync vLLM's decoder with the outlines by returning list."""
 
         def new_decoder(inp_tokens: List[int]) -> List[str]:
+            if (isinstance(inp_tokens, list) and len(inp_tokens) == 1
+                    and isinstance(inp_tokens[0], list)):
+                inp_tokens = inp_tokens[0]
             return [decoder(inp_tokens)]
 
         return new_decoder
