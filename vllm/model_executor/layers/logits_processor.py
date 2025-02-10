@@ -5,6 +5,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
+from vllm.config import get_current_vllm_config
 from vllm.distributed import (tensor_model_parallel_all_gather,
                               tensor_model_parallel_gather)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -42,20 +44,25 @@ class LogitsProcessor(nn.Module):
         # Soft cap the logits. Used in Gemma 2.
         self.soft_cap = soft_cap
         # Whether to use gather or all-gather to gather the logits.
-        self.use_gather = not current_platform.is_tpu()
+
+        parallel_config = get_current_vllm_config().parallel_config
+        self.use_all_gather = current_platform.is_tpu() \
+            or envs.VLLM_USE_V1 \
+            or parallel_config.distributed_executor_backend == "external_launcher" # noqa
 
     def forward(
         self,
         lm_head: VocabParallelEmbedding,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
+        sampling_metadata: Optional[SamplingMetadata] = None,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         if self.logits_as_input:
             logits = hidden_states
         else:
-            hidden_states = _prune_hidden_states(hidden_states,
-                                                 sampling_metadata)
+            if sampling_metadata is not None:
+                hidden_states = _prune_hidden_states(hidden_states,
+                                                     sampling_metadata)
 
             # Get the logits for the next tokens.
             logits = self._get_logits(hidden_states, lm_head, embedding_bias)
@@ -69,7 +76,8 @@ class LogitsProcessor(nn.Module):
                 logits *= self.scale
 
             # Apply logits processors (if any).
-            logits = _apply_logits_processors(logits, sampling_metadata)
+            if sampling_metadata is not None:
+                logits = _apply_logits_processors(logits, sampling_metadata)
 
         return logits
 
@@ -83,16 +91,17 @@ class LogitsProcessor(nn.Module):
         logits = lm_head.linear_method.apply(lm_head,
                                              hidden_states,
                                              bias=embedding_bias)
-        if self.use_gather:
-            # None may be returned for rank > 0
-            logits = tensor_model_parallel_gather(logits)
-        else:
+
+        if self.use_all_gather:
             # Gather is not supported for some devices such as TPUs.
             # Use all-gather instead.
             # NOTE(woosuk): Here, the outputs of every device should not be None
             # because XLA requires strict SPMD among all devices. Every device
             # should execute the same operations after gathering the logits.
             logits = tensor_model_parallel_all_gather(logits)
+        else:
+            # None may be returned for rank > 0
+            logits = tensor_model_parallel_gather(logits)
         # Remove paddings in vocab (if any).
         if logits is not None:
             logits = logits[..., :self.org_vocab_size]
@@ -109,16 +118,38 @@ def _prune_hidden_states(
     hidden_states: torch.Tensor,
     sampling_metadata: SamplingMetadata,
 ) -> torch.Tensor:
-    return hidden_states.index_select(0,
-                                      sampling_metadata.selected_token_indices)
+    # NOTE(kzawora): The if guard is needed for Gaudi - in some scenarios
+    # (warmup, profile_run) we might not have selected_token_indices,
+    # so we skip pruning.
+    if sampling_metadata.selected_token_indices is not None:
+        return hidden_states.index_select(
+            0, sampling_metadata.selected_token_indices)
+    else:
+        return hidden_states
+
+
+def get_num_parameters(logits_processor):
+    """Extracts the number of parameters from the
+    signature and stores it for further use"""
+    if hasattr(logits_processor, 'num_parameters'):
+        return logits_processor.num_parameters
+    logits_processor.num_parameters = len(
+        inspect.signature(logits_processor).parameters)
+    return logits_processor.num_parameters
 
 
 def _apply_logits_processors(
     logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
 ) -> torch.Tensor:
-    found_logits_processors = False
     logits_processed = 0
+    found_logits_processors = any(
+        seq_group.sampling_params.logits_processors
+        for seq_group in sampling_metadata.seq_groups)
+    offload_to_cpu = current_platform.is_hpu() and found_logits_processors
+    if offload_to_cpu:
+        logits_device = logits.device
+        logits = logits.cpu()
     for seq_group in sampling_metadata.seq_groups:
         seq_ids = seq_group.seq_ids
         sampling_params = seq_group.sampling_params
@@ -133,8 +164,7 @@ def _apply_logits_processors(
                 prompt_tokens_ids = seq_group.seq_data[seq_id].prompt_token_ids
 
                 for logits_processor in logits_processors:
-                    parameters = inspect.signature(logits_processor).parameters
-                    if len(parameters) == 3:
+                    if get_num_parameters(logits_processor) == 3:
                         logits_row = logits_processor(prompt_tokens_ids,
                                                       past_tokens_ids,
                                                       logits_row)
@@ -150,4 +180,6 @@ def _apply_logits_processors(
     if found_logits_processors:
         # verifies that no rows in logits were missed unexpectedly
         assert logits_processed == logits.shape[0]
+    if offload_to_cpu:
+        logits = logits.to(logits_device)
     return logits

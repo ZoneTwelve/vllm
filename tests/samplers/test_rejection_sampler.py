@@ -23,16 +23,17 @@ def mock_causal_accepted_tensor(
     """
     batch_size = last_accepted_indices.shape[0]
 
-    accepted = (torch.arange(k).expand(batch_size, k) <=
-                last_accepted_indices.unsqueeze(-1).broadcast_to(
+    accepted = (torch.arange(k).expand(batch_size, k)
+                <= last_accepted_indices.unsqueeze(-1).broadcast_to(
                     batch_size, k))
 
     # Sprinkle accepted values after the contiguous initial accepted values.
     # This replicates the behavior of rejection sampling, which may "accept"
     # a token that cannot be accepted because of causality.
-    sprinkle_candidates = (
-        torch.arange(k).expand(batch_size, k) >
-        last_accepted_indices.unsqueeze(-1).broadcast_to(batch_size, k) + 1)
+    sprinkle_candidates = (torch.arange(k).expand(
+        batch_size,
+        k) > last_accepted_indices.unsqueeze(-1).broadcast_to(batch_size, k) +
+                           1)
     sprinkle = torch.rand(batch_size, k) > 0.5
     accepted[sprinkle_candidates] = sprinkle[sprinkle_candidates]
     return accepted
@@ -84,7 +85,7 @@ def test_correct_output_format(which_tokens_accepted: str, seed: int,
                                     dtype=torch.int64)
 
     rejection_sampler = RejectionSampler(use_flashinfer=use_flashinfer)
-    rejection_sampler.init_gpu_tensors(device=device)
+    rejection_sampler.init_tensors(device=device)
     output_token_ids = rejection_sampler._create_output(  # pylint: disable=protected-access
         accepted,
         recovered_token_ids,
@@ -133,7 +134,7 @@ def test_no_crash_with_varying_dims(k: int, vocab_size: int, batch_size: int,
                                     device: str, use_flashinfer: bool):
     torch.set_default_device(device)
     rejection_sampler = RejectionSampler(use_flashinfer=use_flashinfer)
-    rejection_sampler.init_gpu_tensors(device=device)
+    rejection_sampler.init_tensors(device=device)
 
     draft_probs = torch.rand(batch_size, k, vocab_size, dtype=torch.float32)
     target_probs = torch.rand(batch_size,
@@ -166,7 +167,7 @@ def test_deterministic_when_seeded(k: int, vocab_size: int, batch_size: int,
                                    use_flashinfer: bool):
     torch.set_default_device(device)
     rejection_sampler = RejectionSampler(use_flashinfer=use_flashinfer)
-    rejection_sampler.init_gpu_tensors(device=device)
+    rejection_sampler.init_tensors(device=device)
 
     draft_probs = torch.rand(batch_size, k, vocab_size, dtype=torch.float32)
     target_probs = torch.rand(batch_size,
@@ -198,6 +199,69 @@ def test_deterministic_when_seeded(k: int, vocab_size: int, batch_size: int,
         if seeded_mask[i]:
             for j in range(1, n_rep):
                 assert torch.equal(results[j][i], results[0][i])
+
+
+@pytest.mark.parametrize("k", [1, 3, 6])
+@pytest.mark.parametrize("vocab_size", [30_000, 50_000])
+@pytest.mark.parametrize("batch_size", [3, 8, 32, 128])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("use_flashinfer", [True, False])
+@torch.inference_mode()
+def test_mixed_seeded_batch(k: int, vocab_size: int, batch_size: int,
+                            device: str, use_flashinfer: bool):
+    torch.set_default_device(device)
+    set_random_seed(0)
+    draft_probs = torch.rand(batch_size, k, vocab_size, dtype=torch.float32)
+    target_probs = torch.rand(batch_size,
+                              k + 1,
+                              vocab_size,
+                              dtype=torch.float32)
+    bonus_token_ids = torch.randint(low=0,
+                                    high=vocab_size,
+                                    size=(batch_size, 1),
+                                    dtype=torch.int64)
+    draft_token_ids = torch.randint(low=0,
+                                    high=vocab_size,
+                                    size=(batch_size, k),
+                                    dtype=torch.int64)
+
+    single_batches = []
+    for i in range(batch_size):
+        single_batches.append((draft_probs[i].clone().unsqueeze(0),
+                               draft_token_ids[i].clone().unsqueeze(0),
+                               target_probs[i].clone().unsqueeze(0),
+                               bonus_token_ids[i].clone().unsqueeze(0),
+                               draft_token_ids[i].clone().unsqueeze(0)))
+
+    set_random_seed(0)
+    rejection_sampler = RejectionSampler(use_flashinfer=use_flashinfer)
+    rejection_sampler.init_gpu_tensors(device=device)
+
+    results = []
+    seeded_seqs = {
+        i: torch.Generator(device=device).manual_seed(i)
+        for i in range(1, batch_size)  # 0 is seed None
+    }
+    batch_result = rejection_sampler(target_probs.clone(),
+                                     bonus_token_ids.clone(),
+                                     draft_probs.clone(),
+                                     draft_token_ids.clone(), seeded_seqs)
+
+    set_random_seed(0)
+
+    rejection_sampler = RejectionSampler(use_flashinfer=use_flashinfer)
+    rejection_sampler.init_gpu_tensors(device=device)
+    for i in range(batch_size):
+        request_seeded_seqs = {
+            0: torch.Generator(device=device).manual_seed(i)
+        } if seeded_seqs.get(i) is not None else None
+        (draft_probs, draft_token_ids, target_probs, bonus_token_ids,
+         draft_token_ids) = single_batches[i]
+        results.append(
+            rejection_sampler(target_probs, bonus_token_ids, draft_probs,
+                              draft_token_ids, request_seeded_seqs))
+    for i in range(batch_size):
+        assert torch.equal(batch_result[i], results[i].squeeze(0))
 
 
 @pytest.mark.parametrize("k", [1, 3, 6])
@@ -239,7 +303,7 @@ def test_compare_nonflashinfer_backend(k: int, vocab_size: int,
 
     for use_flashinfer in [True, False]:
         rejection_sampler = RejectionSampler(use_flashinfer=use_flashinfer)
-        rejection_sampler.init_gpu_tensors(device=device)
+        rejection_sampler.init_tensors(device=device)
         # We use seeded sequences to ensure the same tokens are accepted
         # for both flashinfer and nonflashinfer backends.
         seeded_seqs = get_seeded_seqs()
@@ -270,7 +334,7 @@ def test_raises_when_vocab_oob(above_or_below_vocab_range: str,
 
     rejection_sampler = RejectionSampler(use_flashinfer=use_flashinfer,
                                          strict_mode=True)
-    rejection_sampler.init_gpu_tensors(device=device)
+    rejection_sampler.init_tensors(device=device)
 
     draft_probs = torch.rand(batch_size, k, vocab_size, dtype=torch.float32)
     target_probs = torch.rand(batch_size,
@@ -382,8 +446,8 @@ def test_rejection_sampling_approximates_target_distribution(
         distance_wrt_reference)
 
     expected_improvement_multiplier = 20
-    assert (relative_change_in_distance_wrt_target >
-            relative_change_in_distance_wrt_reference *
+    assert (relative_change_in_distance_wrt_target
+            > relative_change_in_distance_wrt_reference *
             expected_improvement_multiplier)
 
 
@@ -401,7 +465,7 @@ class _CorrectnessTestHelper:
         self.vocab_size = vocab_size
         self.vocab_range = (0, vocab_size)
 
-        self.rejection_sampler.init_gpu_tensors(device=0)
+        self.rejection_sampler.init_tensors(device=0)
 
         # Keep test simple, use k=1
         self.k = 1
@@ -413,12 +477,10 @@ class _CorrectnessTestHelper:
     def generate_probs_for_test(
         self, draft_and_target_probs_equal: bool
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        draft_probs, target_probs = [
-            F.softmax(
-                torch.rand(self.vocab_size, dtype=torch.float32),
-                dim=-1,
-            ) for _ in range(2)
-        ]
+        draft_probs, target_probs = (F.softmax(
+            torch.rand(self.vocab_size, dtype=torch.float32),
+            dim=-1,
+        ) for _ in range(2))
 
         num_reference_probs = 100
         reference_probs = F.softmax(
